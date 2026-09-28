@@ -43,6 +43,11 @@ using PCSTR = const char*;
 #define DEFAULT_PORT "27016"
 #define WORKER_THREAD_COUNT 4
 
+#define MAX_MESSAGE_SIZE 1024 * 1024
+#define PACKET_TYPE_SIZE sizeof(uint16_t)
+#define PACKET_LENGTH_SIZE sizeof(uint32_t)
+#define PACKET_HEADER_SIZE (PACKET_TYPE_SIZE + PACKET_LENGTH_SIZE)
+
 class WorkerThread;
 class Server;
 class Client;
@@ -52,8 +57,26 @@ bool set_non_blocking(SOCKET _socket);
 void server_worker(Server* server, WorkerThread* workerThread);
 
 void client_worker(Client* client, WorkerThread* workerThread);
+enum class PacketType : uint16_t {
+    Null,
+    Connect,
+    Disconnect,
+    Message,
+    PlayerMove,
+    RoomJoin,
+    RoomLeave
+};
+
+struct Packet { 
+    PacketType type = PacketType::Null;
+    std::string data;
+};
+
+std::string encodePacket(const Packet& packet); // Type(2) + Size(4) + Data
+bool decodePacket(std::vector<char>& receiveBuffer, Packet& packet);
 
 struct SendMessageData {
+    Packet packet;
     std::string data;
     size_t sentBytes = 0;
 };
@@ -62,6 +85,7 @@ struct SocketData {
     SOCKET _socket;
     std::queue<SendMessageData> messageQueue;
     std::mutex queueMutex;
+    std::vector<char> receiveBuffer;
 };
 
 struct NetEvent {
@@ -77,12 +101,12 @@ struct NetEvent {
 
     Type type;
     SOCKET _socket;
-    std::string message;
+    Packet packet = {PacketType::Null, ""};
 
     NetEvent(
         Type eventType,
         SOCKET eventSocket,
-        const std::string& eventMessage = ""
+        Packet eventpacket = {PacketType::Null, ""}
     );
 };
 
@@ -107,6 +131,7 @@ public:
 
     void enqueueMessage(
         SOCKET sourceSocket,
+        PacketType type,
         const std::string& message
     );
 };
@@ -139,6 +164,7 @@ public:
 
     void sendMessage(
         SOCKET _socket,
+        PacketType type,
         const std::string& message
     );
 
@@ -173,6 +199,7 @@ public:
     );
 
     void sendMessage(
+        PacketType type,
         const std::string& message
     );
 

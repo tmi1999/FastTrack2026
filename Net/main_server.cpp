@@ -24,11 +24,11 @@ int main()
             _socket = event._socket;
             break;
         case NetEvent::Type::Received:
-            printf( "Received from client: %s\n", event.message.c_str());
+            printf( "Received from client: %s\n", event.packet.data.c_str());
             break;
 
         case NetEvent::Type::Sent:
-            printf("Sent to client: %s\n", event.message.c_str());
+            printf("Sent to client: %s\n", event.packet.data.c_str());
             break;
 
         case NetEvent::Type::Closed:
@@ -36,7 +36,7 @@ int main()
             break;
 
         case NetEvent::Type::Error:
-            printf("Network error: %s\n", event.message.c_str());
+            printf("Network error: %s\n", event.packet.data.c_str());
             break;
 
         default:
@@ -45,7 +45,7 @@ int main()
 
         if (_socket != INVALID_SOCKET) {
             printf("Sending Hello\n");
-            server.sendMessage(_socket, "Hello from server");
+            server.sendMessage(_socket, PacketType::Message, "Hello from server");
         }
     } while (true);
     

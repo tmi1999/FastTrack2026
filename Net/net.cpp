@@ -57,6 +57,53 @@ int get_select_nfds(SOCKET maxSocket) {
 #endif
 }
 
+std::string encodePacket(const Packet& packet) {
+    if (packet.data.size() > MAX_MESSAGE_SIZE) {
+        return "";
+    }
+
+    uint16_t type = htons((uint16_t)packet.type);
+
+    uint32_t length = htonl(packet.data.size());
+
+    std::string data;
+    data.append((char*)(&type), sizeof(type));
+    data.append((char*)(&length), sizeof(length));
+    data.append(packet.data);
+
+    return data; // Type(2) + Size(4) + Data
+}
+
+bool decodePacket(std::vector<char>& receiveBuffer, Packet& packet) {
+    if (receiveBuffer.size() < PACKET_HEADER_SIZE) {
+        return false;
+    }
+
+    uint16_t networkType = 0;
+    uint32_t networkLength = 0;
+    std::memcpy(&networkType, receiveBuffer.data(), sizeof(networkType));
+    std::memcpy(&networkLength, receiveBuffer.data() + PACKET_TYPE_SIZE, sizeof(networkLength));
+
+    packet.type = static_cast<PacketType>(ntohs(networkType));
+    uint32_t textLength = ntohl(networkLength);
+    if (textLength > MAX_MESSAGE_SIZE) {
+        receiveBuffer.clear();
+        return false;
+    }
+
+    size_t packetSize = PACKET_HEADER_SIZE + (size_t)textLength;
+    if (receiveBuffer.size() < packetSize) {
+        return false;
+    }
+
+    packet.data.assign((char*)(receiveBuffer.data() + PACKET_HEADER_SIZE), textLength);
+
+    receiveBuffer.erase( receiveBuffer.begin(), receiveBuffer.begin() + packetSize);
+
+    return true;
+}
+
+
 void WorkerThread::start_server(Server* server) {
     running = true;
     workerThread = std::thread(server_worker, server, this);
@@ -99,12 +146,15 @@ std::vector<SocketData*> WorkerThread::getSockets() {
     return sockets;
 }
 
-void WorkerThread::enqueueMessage(SOCKET sourceSocket, const std::string& message) {
+void WorkerThread::enqueueMessage(SOCKET sourceSocket, PacketType type, const std::string& message) {
     std::lock_guard<std::mutex> lock(socketsMutex);
+    Packet packet{type, message};
+    std::string data = encodePacket(packet);
+
     for (SocketData* socketData : sockets) {
         if (socketData->_socket == sourceSocket) {
             std::lock_guard<std::mutex> queueLock(socketData->queueMutex);
-            socketData->messageQueue.push({message, 0});
+            socketData->messageQueue.push({{type, message}, data, 0});
             printf("Enqueued message for socket %llu: %s\n",
                 static_cast<unsigned long long>(socketData->_socket),
                 message.c_str());
@@ -113,8 +163,8 @@ void WorkerThread::enqueueMessage(SOCKET sourceSocket, const std::string& messag
     }
 }
 
-NetEvent::NetEvent(Type eventType, SOCKET eventSocket, const std::string& eventMessage)
-    : type(eventType), _socket(eventSocket), message(eventMessage) {}
+NetEvent::NetEvent(Type eventType, SOCKET eventSocket, Packet eventPacket)
+    : type(eventType), _socket(eventSocket), packet(eventPacket) {}
 
 Server::Server(PCSTR port) : port(port) {}
 
@@ -225,7 +275,7 @@ void Server::update() {
     pushEvent(NetEvent(NetEvent::Accepted, Socket));
 }
 
-void Server::sendMessage(SOCKET _socket, const std::string& message) {
+void Server::sendMessage(SOCKET _socket, PacketType type, const std::string& message) {
     for (WorkerThread* thread : workerThreads) {
         std::vector<SocketData*> sockets = thread->getSockets();
         if (sockets.empty()) {
@@ -235,7 +285,7 @@ void Server::sendMessage(SOCKET _socket, const std::string& message) {
         for (SocketData* socketData : sockets) {
             SOCKET socket = socketData->_socket;
             if (_socket == socket) {
-                thread->enqueueMessage(_socket, message);
+                thread->enqueueMessage(_socket, type, message);
                 return;
             }
         }
@@ -244,7 +294,7 @@ void Server::sendMessage(SOCKET _socket, const std::string& message) {
 
 void Server::pollEvents(NetEvent* event) {
     std::lock_guard<std::mutex> lock(eventQueueMutex);
-    while (!eventQueue.empty()) {
+    if (!eventQueue.empty()) {
         *event = eventQueue.front();
         eventQueue.pop();
     }
@@ -342,12 +392,12 @@ bool Client::connectToServer(PCSTR address, PCSTR port) {
     return true;
 }
 
-void Client::sendMessage(const std::string& message) {
+void Client::sendMessage(PacketType type, const std::string& message) {
     if (workerThread == nullptr || clientSocket == INVALID_SOCKET) {
         return;
     }
 
-    workerThread->enqueueMessage(clientSocket, message);
+    workerThread->enqueueMessage(clientSocket, type, message);
 }
 
 bool Client::pollEvent(NetEvent& event) {
@@ -469,8 +519,17 @@ void server_worker(Server* server, WorkerThread* workerThread) {
             if (FD_ISSET(_socket, &readSet)) {
                 iResult = recv(_socket, recvbuf, recvbuflen, 0);
                 if (iResult > 0) {
+                    socketData->receiveBuffer.insert(
+                        socketData->receiveBuffer.end(),
+                        (uint8_t*)recvbuf,
+                        (uint8_t*)recvbuf + iResult
+                    );
                     printf("Bytes received: %d\n", iResult);
-                    server->pushEvent(NetEvent(NetEvent::Received, _socket, std::string(recvbuf, iResult)));
+
+                    Packet packet;
+                    while (decodePacket(socketData->receiveBuffer, packet)) {
+                        server->pushEvent(NetEvent(NetEvent::Received, _socket, packet));
+                    }
                 }
                 else if (iResult == 0) {
                     printf("Connection closed by client socket %llu\n", static_cast<unsigned long long>(_socket));
@@ -517,7 +576,7 @@ void server_worker(Server* server, WorkerThread* workerThread) {
                         }
 
                         printf("send failed with error: %d\n", error);
-                        server->pushEvent(NetEvent(NetEvent::Error, _socket, "Send failed"));
+                        server->pushEvent(NetEvent(NetEvent::Error, _socket));
                         break;
                     }
                     else if (sendResult == 0) {
@@ -526,15 +585,11 @@ void server_worker(Server* server, WorkerThread* workerThread) {
                         break;
                     }
                     else {
-                        server->pushEvent(NetEvent(
-                            NetEvent::Sent,
-                            _socket,
-                            message.data.substr(bufferSent, sendResult)
-                        ));
-
                         message.sentBytes += sendResult;
 
                         if (message.sentBytes >= bufferSize) {
+                            Packet sentPacket = message.packet;
+                            server->pushEvent(NetEvent(NetEvent::Sent, _socket, sentPacket));
                             messageQueue->pop();
                         }
 
@@ -621,16 +676,23 @@ void client_worker(Client* client, WorkerThread* workerThread) {
             if (FD_ISSET(_socket, &readSet)) {
                 iResult = recv(_socket, recvbuf, recvbuflen, 0);
                 if (iResult > 0) {
+                    socketData->receiveBuffer.insert(
+                        socketData->receiveBuffer.end(),
+                        (uint8_t*)recvbuf,
+                        (uint8_t*)recvbuf + iResult
+                    );
                     printf("Bytes received: %d\n", iResult);
-                    client->pushEvent(NetEvent(NetEvent::Received, _socket, std::string(recvbuf, iResult)));
+
+                    Packet packet;
+                    while (decodePacket(socketData->receiveBuffer, packet)) {
+                        client->pushEvent(NetEvent(NetEvent::Received, _socket, packet));
+                    }
                 }
                 else if (iResult == 0) {
-                    printf("Connection closed by client _socket %d\n", _socket);
+                    printf("Connection closed by client socket %llu\n", static_cast<unsigned long long>(_socket));
                     close_socket(_socket);
                     workerThread->removeSocket(_socket);
-                    client->setConnected(false);
                     client->pushEvent(NetEvent(NetEvent::Closed, _socket));
-                    socketClosed = true;
                 }
                 else {
                     int error = get_socket_error();
@@ -641,14 +703,8 @@ void client_worker(Client* client, WorkerThread* workerThread) {
                     printf("recv failed with error: %d\n", error);
                     close_socket(_socket);
                     workerThread->removeSocket(_socket);
-                    client->setConnected(false);
                     client->pushEvent(NetEvent(NetEvent::Closed, _socket));
-                    socketClosed = true;
                 }
-            }
-
-            if (socketClosed) {
-                continue;
             }
 
             if (FD_ISSET(_socket, &writeSet)) {
@@ -656,7 +712,7 @@ void client_worker(Client* client, WorkerThread* workerThread) {
                 messageQueue = &socketData->messageQueue;
 
                 while (!messageQueue->empty()) {
-                    printf("Sending message to client _socket %d\n", _socket);
+                    printf("Sending message to client socket %d\n", _socket);
 
                     SendMessageData& message = messageQueue->front();
                     size_t bufferSize = message.data.size();
@@ -677,35 +733,30 @@ void client_worker(Client* client, WorkerThread* workerThread) {
                         }
 
                         printf("send failed with error: %d\n", error);
-                        client->pushEvent(NetEvent(NetEvent::Error, _socket, "Send failed"));
+                        client->pushEvent(NetEvent(NetEvent::Error, _socket));
                         break;
                     }
                     else if (sendResult == 0) {
-                        printf("Connection closed by client _socket %d\n", _socket);
-                        client->setConnected(false);
+                        printf("Connection closed by client socket %d\n", _socket);
                         client->pushEvent(NetEvent(NetEvent::Closed, _socket));
                         break;
                     }
                     else {
-                        client->pushEvent(NetEvent(
-                            NetEvent::Sent,
-                            _socket,
-                            message.data.substr(bufferSent, sendResult)
-                        ));
-
                         message.sentBytes += sendResult;
 
                         if (message.sentBytes >= bufferSize) {
+                            Packet sentPacket = message.packet;
+                            client->pushEvent(NetEvent(NetEvent::Sent, _socket, sentPacket));
                             messageQueue->pop();
-                        }
-                        else {
-                            break;
                         }
 
                         printf("Sent %d bytes to client _socket %d\n", sendResult, _socket);
-
                     }
                 }
+            }
+
+            if (socketClosed) {
+                continue;
             }
         }
     }

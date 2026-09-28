@@ -27,11 +27,11 @@ int main()
                 break;
 
             case NetEvent::Type::Received:
-                printf( "Received from server: %s\n", event.message.c_str());
+                printf( "Received from server, type: \"%d\", data: %s\n", event.packet.type, event.packet.data.c_str());
                 break;
 
             case NetEvent::Type::Sent:
-                printf("Sent to server: %s\n", event.message.c_str());
+                printf("Sent to server: %s\n", event.packet.data.c_str());
                 break;
 
             case NetEvent::Type::Closed:
@@ -40,7 +40,7 @@ int main()
                 break;
 
             case NetEvent::Type::Error:
-                printf("Network error: %s\n", event.message.c_str());
+                printf("Network error: %s\n", event.packet.data.c_str());
                 running = false;
                 break;
 
@@ -51,7 +51,7 @@ int main()
 
         if (client.isConnected() && !sentHello) {
             printf("Sending Hello!\n");
-            client.sendMessage("Hello from client");
+            client.sendMessage(PacketType::Message, "Hello from client");
             sentHello = true;
         }
     }
